@@ -1,0 +1,153 @@
+name: ghost-aws
+
+# Application CI/CD (option A):
+#   pull request -> compile admin + build the image (nothing is pushed, no AWS access)
+#   push to main -> build, push to ECR, deploy to ECS, smoke test
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for AWS
+
+concurrency:
+  group: ghost-aws-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  CONTAINER_NAME: ghost
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+
+      # ---- 1. Admin and embed-renderer are built OUTSIDE Docker (Dockerfile.production copies them from the context) ----
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable pnpm (version pinned by packageManager in package.json)
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin
+        run: pnpm nx run @tryghost/admin:build
+
+      - name: Check build output required by the Dockerfile
+        run: |
+          for d in ghost/core/built/admin ghost/core/built/embed-renderer; do
+            if [ ! -d "$d" ]; then echo "::error::$d was not produced by the admin build"; exit 1; fi
+          done
+          du -sh ghost/core/built/*
+
+      # ---- 2. Image ----
+      - name: Compute Ghost build version
+        id: ver
+        run: |
+          if [ -f ghost/core/package.json ]; then F=ghost/core/package.json; else F=ghost/package.json; fi
+          V=$(node -p "require('./$F').version")
+          echo "version=${V}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        if: env.PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        if: env.PUSH == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.production
+          target: selfhost
+          platforms: linux/amd64
+          push: ${{ env.PUSH == 'true' }}
+          build-args: |
+            GHOST_BUILD_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ steps.ecr.outputs.registry || 'local' }}/${{ env.ECR_REPOSITORY }}:main
+            ${{ steps.ecr.outputs.registry || 'local' }}/${{ env.ECR_REPOSITORY }}:${{ steps.ver.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- 3. Deploy (only when the ECS service already exists) ----
+      - name: Does the ECS service exist?
+        if: env.PUSH == 'true'
+        id: svc
+        run: |
+          N=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+                --query 'length(services[?status==`ACTIVE`])' --output text 2>/dev/null || echo 0)
+          echo "exists=$([ "$N" = "1" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$N" != "1" ]; then echo "::notice::ECS service not found yet. Image pushed; run terraform apply and re-run this workflow."; fi
+
+      - name: Download current task definition
+        if: steps.svc.outputs.exists == 'true'
+        run: |
+          TD=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+                 --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$TD" --query taskDefinition > task-definition.json
+
+      - name: Render task definition with the new image
+        if: steps.svc.outputs.exists == 'true'
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.ver.outputs.short }}
+
+      # The service has a deployment circuit breaker: if the new task never gets healthy, ECS rolls back by itself
+      - name: Deploy to ECS
+        if: steps.svc.outputs.exists == 'true'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 20
+
+      - name: Smoke test
+        if: steps.svc.outputs.exists == 'true'
+        run: |
+          LB="${ECS_CLUSTER%-cluster}-alb"
+          DNS=$(aws elbv2 describe-load-balancers --names "$LB" --query 'LoadBalancers[0].DNSName' --output text)
+          echo "Testing http://$DNS/"
+          for i in $(seq 1 18); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$DNS/" || true)
+            echo "attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then echo "Smoke test OK"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::Ghost did not answer 200 in time"; exit 1
